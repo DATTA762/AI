@@ -4,180 +4,100 @@ from groq import Groq
 
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.document_loaders import TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-from sentence_transformers import CrossEncoder
 
 import os
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# ---------------------------
+# ENV
+# ---------------------------
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
 if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY not set in environment")
+    raise RuntimeError("GROQ_API_KEY not set")
 
-# FastAPI app
-app = FastAPI(title="Render RAG API")
-os.environ["HUGGINGFACE_HUB_TOKEN"] = os.getenv("HF_TOKEN")
+client = Groq(api_key=GROQ_API_KEY)
 
-# Request schema
+# ---------------------------
+# APP
+# ---------------------------
+
+app = FastAPI()
+
+@app.get("/")
+def health():
+    return {"status": "ok"}   # ✅ needed for Render
+
+# ---------------------------
+# REQUEST MODEL
+# ---------------------------
+
 class QueryRequest(BaseModel):
     query: str
 
+# ---------------------------
+# GLOBALS (lazy loading)
+# ---------------------------
 
-print("Loading models...")
+retriever = None
 
-# Embedding model
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    encode_kwargs={"normalize_embeddings": True}
-)
+def load_store():
+    global retriever
 
-# Cross Encoder reranker
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    if retriever is not None:
+        return
 
-# Groq client
-client = Groq(api_key=GROQ_API_KEY)
+    print("Loading FAISS...")
 
-# Paths
-FAISS_PATH = "faiss_index"
-DOCS_PATH = "documents/usa2.txt"
+    embedding = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
 
-# Create or load FAISS index
-if os.path.exists(FAISS_PATH):
-    print("Loading existing FAISS index...")
-    vector_store = FAISS.load_local(
-        FAISS_PATH,
-        embedding_model,
+    db = FAISS.load_local(
+        "faiss_index",
+        embedding,
         allow_dangerous_deserialization=True
     )
 
-else:
-    print("Creating new FAISS index...")
+    retriever = db.as_retriever(search_kwargs={"k": 3})
 
-    loader = TextLoader(DOCS_PATH, encoding="utf-8")
-    docs = loader.load()
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50
-    )
-
-    split_docs = splitter.split_documents(docs)
-
-    vector_store = FAISS.from_documents(
-        split_docs,
-        embedding_model
-    )
-
-    vector_store.save_local(FAISS_PATH)
-
-    print("FAISS index created and saved.")
-
-# Retriever
-retriever = vector_store.as_retriever(search_kwargs={"k": 10})
-
-print("RAG system ready!")
-
+    print("FAISS loaded")
 
 # ---------------------------
-# Reranking Function
-# ---------------------------
-
-def rerank(query, docs, top_k=3):
-
-    if not docs:
-        return []
-
-    pairs = [(query, doc.page_content) for doc in docs]
-
-    scores = reranker.predict(pairs)
-
-    ranked = sorted(
-        zip(scores, docs),
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    return [doc for _, doc in ranked[:top_k]]
-
-
-# ---------------------------
-# Groq LLM Generation
+# LLM
 # ---------------------------
 
 def generate_answer(query, context):
 
     if not context.strip():
-        return "Not found in the document."
+        return "Not found in document"
 
     response = client.chat.completions.create(
-
         model="llama-3.1-8b-instant",
-
         messages=[
-            {
-                "role": "system",
-                "content": "Answer strictly from the provided context."
-            },
-            {
-                "role": "user",
-                "content": f"""
-Context:
-{context}
-
-Question:
-{query}
-
-Answer in 1-2 lines. If not found say 'Not found in document'.
-"""
-            }
+            {"role": "system", "content": "Answer only from context."},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion:\n{query}"}
         ]
-
     )
 
     return response.choices[0].message.content
 
-
 # ---------------------------
-# API Endpoint
+# API
 # ---------------------------
 
 @app.post("/ask")
+def ask(request: QueryRequest):
 
-def ask_question(request: QueryRequest):
+    load_store()  # ✅ load after server starts
 
     query = request.query.strip()
-
     if not query:
-        raise HTTPException(
-            status_code=400,
-            detail="Query cannot be empty"
-        )
+        raise HTTPException(status_code=400, detail="Empty query")
 
-    # Retrieve documents
     docs = retriever.get_relevant_documents(query)
 
-    # Rerank
-    reranked_docs = rerank(query, docs)
+    context = "\n\n".join([d.page_content for d in docs])
 
-    # Build context
-    context = "\n\n".join(
-        [doc.page_content for doc in reranked_docs]
-    )
-
-    # Generate answer
     answer = generate_answer(query, context)
 
-    return {
-        "query": query,
-        "answer": answer,
-        "sources": [
-            doc.metadata.get("source", "unknown")
-            for doc in reranked_docs
-        ]
-    }
+    return {"answer": answer}
